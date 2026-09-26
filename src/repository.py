@@ -54,6 +54,22 @@ class Repository:
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
                 );
+                CREATE TABLE IF NOT EXISTS signoffs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL
+                        CHECK(status IN ('submitted','approved','rejected','invalidated')),
+                    conclusion TEXT NOT NULL,
+                    basis_version INTEGER NOT NULL,
+                    submitted_by TEXT NOT NULL,
+                    submitted_at TEXT NOT NULL,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    review_comment TEXT,
+                    invalidated_reason TEXT,
+                    invalidated_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS ix_signoffs_item ON signoffs(item_id, id);
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -108,7 +124,7 @@ class Repository:
         return [self._item(row) for row in rows]
 
     def transition_item(self, item_id: int, target: str, expected_version: int,
-                        actor: str) -> Dict[str, Any]:
+                        actor: str) -> tuple:
         now = utc_now()
         with self._lock, self.conn:
             cur = self.conn.execute(
@@ -121,10 +137,27 @@ class Repository:
                 if exists is None:
                     raise NotFoundError("项目不存在")
                 raise ConflictError("版本冲突，请刷新后重试")
-        return self.get_item(item_id)
+            # 进入关闭态时会签被关闭动作消费；其余状态变动使在途/已通过会签失效
+            invalidated = [] if target == "closed" else self._invalidate_active_signoffs(
+                item_id, "事件状态变动", now)
+        return self.get_item(item_id), invalidated
+
+    def _invalidate_active_signoffs(self, item_id: int, reason: str, now: str) -> list:
+        rows = self.conn.execute(
+            "SELECT id FROM signoffs WHERE item_id=? AND status IN ('submitted','approved')",
+            (item_id,),
+        ).fetchall()
+        signoff_ids = [int(row["id"]) for row in rows]
+        if signoff_ids:
+            self.conn.executemany(
+                """UPDATE signoffs SET status='invalidated', invalidated_reason=?,
+                   invalidated_at=? WHERE id=?""",
+                [(reason, now, signoff_id) for signoff_id in signoff_ids],
+            )
+        return signoff_ids
 
     def add_record(self, item_id: int, kind: str, detail: str, status: str,
-                   external_ref: Optional[str], actor: str) -> Dict[str, Any]:
+                   external_ref: Optional[str], actor: str) -> tuple:
         now = utc_now()
         self.get_item(item_id)
         try:
@@ -135,11 +168,17 @@ class Repository:
                     (item_id, kind, detail, status, external_ref, actor, now),
                 )
                 record_id = int(cur.lastrowid)
+                # 记录变动即产生新版本，并使原会签全部失效
+                self.conn.execute(
+                    "UPDATE items SET version=version+1, updated_at=? WHERE id=?",
+                    (now, item_id),
+                )
+                invalidated = self._invalidate_active_signoffs(item_id, "记录变动", now)
         except sqlite3.IntegrityError as exc:
             raise ConflictError("记录唯一标识已存在") from exc
         with self._lock:
             row = self.conn.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
-        return dict(row)
+        return dict(row), invalidated
 
     def list_records(self, item_id: int) -> List[Dict[str, Any]]:
         self.get_item(item_id)
@@ -156,6 +195,84 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    @staticmethod
+    def _signoff(row: sqlite3.Row) -> Dict[str, Any]:
+        return dict(row)
+
+    def create_signoff(self, item_id: int, conclusion: str, basis_version: int,
+                       actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO signoffs(item_id, status, conclusion, basis_version,
+                   submitted_by, submitted_at) VALUES(?,?,?,?,?,?)""",
+                (item_id, "submitted", conclusion, basis_version, actor, now),
+            )
+            signoff_id = int(cur.lastrowid)
+        return self.get_signoff(signoff_id)
+
+    def get_signoff(self, signoff_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM signoffs WHERE id=?", (signoff_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("会签不存在")
+        return self._signoff(row)
+
+    def latest_signoff(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM signoffs WHERE item_id=? ORDER BY id DESC LIMIT 1",
+                (item_id,),
+            ).fetchone()
+        return self._signoff(row) if row else None
+
+    def latest_signoffs(self, item_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        result: Dict[int, Dict[str, Any]] = {}
+        if not item_ids:
+            return result
+        placeholders = ",".join("?" for _ in item_ids)
+        with self._lock:
+            rows = self.conn.execute(
+                f"""SELECT s.* FROM signoffs s
+                    JOIN (SELECT item_id, MAX(id) AS max_id FROM signoffs
+                          WHERE item_id IN ({placeholders}) GROUP BY item_id) m
+                    ON s.item_id=m.item_id AND s.id=m.max_id""",
+                tuple(item_ids),
+            ).fetchall()
+        for row in rows:
+            result[int(row["item_id"])] = self._signoff(row)
+        return result
+
+    def list_signoffs(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM signoffs WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [self._signoff(row) for row in rows]
+
+    def review_signoff(self, signoff_id: int, status: str, comment: Optional[str],
+                       actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE signoffs SET status=?, review_comment=?, reviewed_by=?,
+                   reviewed_at=? WHERE id=? AND status='submitted'""",
+                (status, comment, actor, now, signoff_id),
+            )
+            if cur.rowcount == 0:
+                row = self.conn.execute(
+                    "SELECT status FROM signoffs WHERE id=?", (signoff_id,)
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError("会签不存在")
+                if row["status"] == "invalidated":
+                    raise ConflictError("会签已随版本变动失效，需在新版本上重新提交")
+                raise ConflictError("该会签已复核，不能重复审核")
+        return self.get_signoff(signoff_id)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
