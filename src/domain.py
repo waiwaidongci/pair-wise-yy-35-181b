@@ -20,10 +20,20 @@ class Record:
 @dataclass(frozen=True)
 class AuditEntry:
     id:int; action:str; entity_type:str; entity_id:int; actor:str; detail:Dict[str,Any]; previous_hash:str; entry_hash:str; created_at:str
+SIGNOFF_STATUSES=['submitted','approved','rejected','invalidated']; SIGNOFF_DECISIONS=['approved','rejected']
+@dataclass(frozen=True)
+class Signoff:
+    id:int; item_id:int; basis_version:int; conclusion:str; evidence_ref:Optional[str]; submitted_by:str; submitted_at:str; status:str; reviewed_by:Optional[str]; review_comment:Optional[str]; reviewed_at:Optional[str]; invalidated_reason:Optional[str]; invalidated_at:Optional[str]; created_at:str; updated_at:str
 def require_text(value,field,max_length=2000):
     if not isinstance(value,str) or not value.strip(): raise ValidationError(f"{field}不能为空")
     value=value.strip()
     if len(value)>max_length: raise ValidationError(f"{field}不能超过{max_length}个字符")
+    return value
+def require_version(value,field="version"):
+    if isinstance(value,bool) or not isinstance(value,int) or value<1: raise ValidationError(f"{field}必须是正整数")
+    return value
+def require_decision(value):
+    if value not in SIGNOFF_DECISIONS: raise ValidationError("decision必须是approved或rejected")
     return value
 def normalize_severity(value):
     if value not in SEVERITIES: raise ValidationError("severity不在允许范围内")
